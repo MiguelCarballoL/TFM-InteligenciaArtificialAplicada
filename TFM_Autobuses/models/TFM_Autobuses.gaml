@@ -246,8 +246,8 @@ global {
 		list<parada> todas_paradas_con_ruta <- remove_duplicates(ruta_linea_A + ruta_linea_B);
 
 		loop i from: 1 to: pasajeros_por_oleada {
-			parada p_origen <- one_of(todas_paradas_con_ruta);
-			if (mapa_accesibilidad[p_origen] != nil) and (length(mapa_accesibilidad[p_origen]) > 0) {
+			parada p_origen <- one_of(todas_paradas_con_ruta where (mapa_accesibilidad[each] != nil and length(mapa_accesibilidad[each]) > 0));
+			if (p_origen != nil) {
 				parada p_destino <- one_of(mapa_accesibilidad[p_origen]);
 				create pasajero {
 					id_pasajero <- total_pasajeros_generados;
@@ -542,9 +542,14 @@ species autobus skills: [moving, fipa] control: simple_bdi {
 
 	list<pasajero> pasajeros_a_bordo <- [];
 
-	// Control de CFP de embarque
+	// Control de CFP de subida
 	int respuestas_cfp_esperadas <- 0;
 	bool cfp_enviado <- false;
+
+	// Control de CFP de bajada
+	list<pasajero> pasajeros_quieren_bajar <- [];
+	int respuestas_bajada_esperadas <- 0;
+	bool cfp_bajada_enviado <- false;
 
 	// Inicialización
 	init {
@@ -616,8 +621,13 @@ species autobus skills: [moving, fipa] control: simple_bdi {
 		if (has_belief(creencia_acceso_parada)) {
 			// Bajada de pasajeros
 			if (!has_belief(creencia_bajada_completada)) {
-				do proceso_bajada;
-				do add_belief(creencia_bajada_completada);
+				if (!cfp_bajada_enviado) {
+					do proceso_bajada_cfp;
+					cfp_bajada_enviado <- true;
+				}
+				if (cfp_bajada_enviado and respuestas_bajada_esperadas <= 0) {
+					do add_belief(creencia_bajada_completada);
+				}
 			}
 
 			// Subida de pasajeros
@@ -644,6 +654,10 @@ species autobus skills: [moving, fipa] control: simple_bdi {
 				do remove_belief(creencia_esperando_cola);
 				cfp_enviado <- false;
 				respuestas_cfp_esperadas <- 0;
+				
+				cfp_bajada_enviado <- false;
+				respuestas_bajada_esperadas <- 0;
+				pasajeros_quieren_bajar <- [];
 
 				// Reiniciar velocidad al arrancar de la parada
 				velocidad_actual <- 0.0;
@@ -662,41 +676,15 @@ species autobus skills: [moving, fipa] control: simple_bdi {
 
 	// Acciones
 	// Permitir bajada y bajada de pasajeros
-	action proceso_bajada {
-		list<pasajero> pasajeros_que_bajan <- [];
-		loop p over: pasajeros_a_bordo {
-			if (p.siguiente_destino = parada_actual_bus) {
-				pasajeros_que_bajan << p;
+	action proceso_bajada_cfp {
+		if (length(pasajeros_quieren_bajar) > 0) {
+			respuestas_bajada_esperadas <- length(pasajeros_quieren_bajar);
+			loop p over: pasajeros_quieren_bajar {
+				do start_conversation to: [p] protocol: 'fipa-contract-net' performative: 'cfp' contents: ["quieres_bajar", parada_actual_bus];
 			}
-		}
-		loop p over: pasajeros_que_bajan {
-			pasajeros_a_bordo <- pasajeros_a_bordo - p;
-			plazas_disponibles <- plazas_disponibles + 1;
-
-			if (length(p.itinerario_destinos) > 1) {
-				// Transbordo
-				p.itinerario_destinos <- p.itinerario_destinos - p.itinerario_destinos[0];
-				p.siguiente_destino <- p.itinerario_destinos[0];
-				p.en_autobus <- false;
-				p.bus_actual <- nil;
-				p.location <- parada_actual_bus.location;
-				p.parada_actual <- parada_actual_bus;
-				p.esperando_en_parada <- true;
-				p.tiempo_llegada_parada <- time;
-				do start_conversation to: [parada_actual_bus] protocol: 'no-protocol' performative: 'inform' contents: ["pasajero_llega"];
-				if console_logs { write "[BUS " + id_bus + "] Pasajero " + p.id_pasajero + " baja para transbordo en " + parada_actual_bus.id_parada; }
-			} else {
-				// Destino final
-				p.en_autobus <- false;
-				p.bus_actual <- nil;
-				p.destino_alcanzado <- true;
-				p.tiempo_total <- time - p.tiempo_inicio;
-				total_pasajeros_llegados <- total_pasajeros_llegados + 1;
-				if console_logs { write "[BUS " + id_bus + "] Pasajero " + p.id_pasajero + " llega a destino " + parada_actual_bus.id_parada; }
-			}
-		}
-		if console_logs and (length(pasajeros_que_bajan) > 0) {
-			write "[BUS " + id_bus + " " + linea + "] " + length(pasajeros_que_bajan) + " bajan en " + parada_actual_bus.id_parada + ". Plazas: " + plazas_disponibles;
+			if console_logs { write "[BUS " + id_bus + " " + linea + "] CFP bajada a " + length(pasajeros_quieren_bajar) + " pasajeros en " + parada_actual_bus.id_parada; }
+		} else {
+			respuestas_bajada_esperadas <- 0;
 		}
 	}
 
@@ -765,6 +753,14 @@ species autobus skills: [moving, fipa] control: simple_bdi {
 					do reject_proposal message: p contents: ["autobus_lleno"];
 					if console_logs { write "[BUS " + id_bus + " " + linea + "] Rechazado: bus lleno"; }
 				}
+			} else if (content[0] = "quiero_bajar") {
+				respuestas_bajada_esperadas <- respuestas_bajada_esperadas - 1;
+				pasajero pas <- p.sender;
+				pasajeros_a_bordo <- pasajeros_a_bordo - pas;
+				plazas_disponibles <- plazas_disponibles + 1;
+				pasajeros_quieren_bajar <- pasajeros_quieren_bajar - pas;
+				do accept_proposal message: p contents: ["bajada_aceptada"];
+				if console_logs { write "[BUS " + id_bus + " " + linea + "] Pasajero " + pas.id_pasajero + " baja en " + parada_actual_bus.id_parada + ". Plazas: " + plazas_disponibles; }
 			}
 		}
 	}
@@ -793,13 +789,13 @@ species autobus skills: [moving, fipa] control: simple_bdi {
 		}
 	}
 
-	// Recibir informs del mapa o de la parada
+	// Recibir informs del mapa o de la parada o de pasajeros
 	reflex receive_inform when: !empty(informs) {
 		loop i over: informs {
 			list content <- list(i.contents);
 			if (content[0] = "carretera_bloqueada") {
 				do recalcular_ruta;
-				} else if (content[0] = "carretera_trafico") {
+			} else if (content[0] = "carretera_trafico") {
 				// La velocidad se ajusta dinámicamente al pasar por la calle congestionada
 				if console_logs { write "[BUS " + id_bus + " " + linea + "] Notificado de tráfico en carretera"; }
 			} else if (content[0] = "parada_disponible") {
@@ -807,6 +803,13 @@ species autobus skills: [moving, fipa] control: simple_bdi {
 				do remove_belief(creencia_esperando_cola);
 				do add_belief(creencia_acceso_parada);
 				if console_logs { write "[BUS " + id_bus + " " + linea + "] Parada disponible, operando"; }
+			} else if (content[0] = "quiero_bajar_siguiente") {
+				// Pasajero notifica que quiere bajar en la siguiente parada
+				pasajero pas <- i.sender;
+				if (!(pas in pasajeros_quieren_bajar)) {
+					pasajeros_quieren_bajar << pas;
+				}
+				if console_logs { write "[BUS " + id_bus + " " + linea + "] Pasajero " + pas.id_pasajero + " solicita bajar en próxima parada"; }
 			}
 			do end_conversation message: i contents: [];
 		}
@@ -835,7 +838,6 @@ species pasajero skills: [fipa] control: simple_bdi {
 
 	// Deseos BDI
 	predicate deseo_llegar_parada <- new_predicate("llegar_parada");
-	predicate deseo_solicitar_eta <- new_predicate("solicitar_eta");
 
 	// Estado
 	parada parada_origen;
@@ -854,6 +856,7 @@ species pasajero skills: [fipa] control: simple_bdi {
 	float tiempo_total <- 0.0;
 	float tiempo_espera <- 0.0;
 	float ultima_solicitud_eta <- 0.0;
+	bool bajada_notificada <- false;
 
 	// Inicialización
 	init {
@@ -937,7 +940,11 @@ species pasajero skills: [fipa] control: simple_bdi {
 	reflex receive_cfps when: !empty(cfps) {
 		loop c over: cfps {
 			list content <- list(c.contents);
-			if (content[0] = "quieres_subir") {
+			if (content[0] = "quieres_bajar") {
+				// Confirmar que quiero bajar
+				do propose message: c contents: ["quiero_bajar"];
+				if console_logs { write "[PASAJERO " + id_pasajero + "] Confirma bajada en " + siguiente_destino.id_parada; }
+			} else if (content[0] = "quieres_subir") {
 				list<parada> ruta_bus <- content[1];
 				string linea_bus <- string(content[2]);
 
@@ -979,6 +986,7 @@ species pasajero skills: [fipa] control: simple_bdi {
 				bus_actual <- a.sender;
 				en_autobus <- true;
 				esperando_en_parada <- false;
+				bajada_notificada <- false;
 				tiempo_espera <- time - tiempo_llegada_parada;
 
 				do remove_belief(creencia_esperando);
@@ -989,6 +997,34 @@ species pasajero skills: [fipa] control: simple_bdi {
 				do start_conversation to: [parada_actual] protocol: 'no-protocol' performative: 'inform' contents: ["pasajero_sube_bus"];
 
 				if console_logs { write "[PASAJERO " + id_pasajero + "] Sube al bus. Espera: " + tiempo_espera + "s"; }
+			} else if (content[0] = "bajada_aceptada") {
+				// Bajada aceptada por el bus
+				autobus bus_bajada <- a.sender;
+				parada parada_bajada <- bus_bajada.parada_actual_bus;
+
+				do remove_belief(creencia_en_bus);
+				en_autobus <- false;
+				bus_actual <- nil;
+
+				if (length(itinerario_destinos) > 1) {
+					// Quitar el destino actual y esperar otro bus
+					itinerario_destinos <- itinerario_destinos - itinerario_destinos[0];
+					siguiente_destino <- itinerario_destinos[0];
+					location <- parada_bajada.location;
+					parada_actual <- parada_bajada;
+					esperando_en_parada <- true;
+					tiempo_llegada_parada <- time;
+					do add_belief(creencia_esperando);
+					do remove_belief(creencia_parada_notificada);
+					do start_conversation to: [parada_bajada] protocol: 'no-protocol' performative: 'inform' contents: ["pasajero_llega"];
+					if console_logs { write "[PASAJERO " + id_pasajero + "] Baja para transbordo en " + parada_bajada.id_parada; }
+				} else {
+					// Destino final
+					destino_alcanzado <- true;
+					tiempo_total <- time - tiempo_inicio;
+					total_pasajeros_llegados <- total_pasajeros_llegados + 1;
+					if console_logs { write "[PASAJERO " + id_pasajero + "] Llega a destino " + parada_bajada.id_parada; }
+				}
 			}
 		}
 	}
@@ -1028,6 +1064,16 @@ species pasajero skills: [fipa] control: simple_bdi {
 	reflex solicitar_eta_periodica when: esperando_en_parada and !destino_alcanzado and (parada_actual != nil) and (time - ultima_solicitud_eta >= 30 #s) {
 		ultima_solicitud_eta <- time;
 		do start_conversation to: [parada_actual] protocol: 'fipa-request' performative: 'request' contents: ["solicitud_eta"];
+	}
+
+	
+	// Avisar al bus de que quiero bajar en la siguiente parada
+	reflex avisar_bajada when: en_autobus and (bus_actual != nil) and !destino_alcanzado and !bajada_notificada {
+		if (bus_actual.parada_destino = siguiente_destino) {
+			bajada_notificada <- true;
+			do start_conversation to: [bus_actual] protocol: 'no-protocol' performative: 'inform' contents: ["quiero_bajar_siguiente"];
+			if console_logs { write "[PASAJERO " + id_pasajero + "] Avisa al bus " + bus_actual.id_bus + " que quiere bajar en " + siguiente_destino.id_parada; }
+		}
 	}
 
 	// Seguir al autobús cuando está a bordo
@@ -1256,7 +1302,7 @@ experiment Test_Abandono_Parada type: gui {
 	parameter "Pasajeros por oleada" var: pasajeros_por_oleada init: 0;
 	parameter "Prob. bloqueo" var: prob_bloqueo_carretera init: 0.0;
 	parameter "Prob. tráfico" var: prob_trafico_carretera init: 0.0;
-	parameter "Tiempo máx. espera" var: tiempo_max_espera_pasajero init: 120.0;
+	parameter "Tiempo máx. espera" var: tiempo_max_espera_pasajero init: 180.0;
 	parameter "Tiempo simulación" var: max_tiempo_simulacion init: 3600.0;
 	parameter "Logs" var: console_logs init: true;
 
