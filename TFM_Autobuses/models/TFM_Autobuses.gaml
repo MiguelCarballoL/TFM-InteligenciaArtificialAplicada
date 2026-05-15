@@ -27,8 +27,10 @@ global {
 
 	// Parámetros de autobuses
 	// Paradas donde aparecerá un bus al inicio
-	list<string> paradas_inicio_A <- ["3644", "15525", "5296", "51143"];
-	list<string> paradas_inicio_B <- ["2481"];
+	//list<string> paradas_inicio_A <- ["3644", "4802", "4614", "782", "51142", "2697", "51144", "15525", "1414", "2696", "51143", "3829", "4962", "3742"];
+	//list<string> paradas_inicio_B <- ["2481", "5141", "51033", "1414"];
+	list<string> paradas_inicio_A <- ["3644", "4802", "4614", "782", "51142", "2697", "51144", "15525", "1414", "2696", "51143", "3829", "4962", "3742"];
+	list<string> paradas_inicio_B <- ["2481", "5141", "51033", "1414"];
 	int capacidad_maxima_bus <- 86;
 	float velocidad_bus <- 40.0 #km / #h;
 	float frecuencia_creacion_buses <- 600 #s;
@@ -42,10 +44,24 @@ global {
 	int total_pasajeros_generados <- 0;
 	int total_pasajeros_llegados <- 0;
 	int total_pasajeros_abandonados <- 0;
+	float media_paradas_lineaA <- 8.0;
+	float desviacion_paradas_lineaA <- 4.0;
+	float media_paradas_lineaB <- 3.0;
+	float desviacion_paradas_lineaB <- 1.0;
+	float prob_transbordo_pasajero <- 0.15;
+
+	// Paradas finales de cada línea (capan el trayecto del pasajero)
+	map<string, list<string>> paradas_finales_linea <- ["LineaA"::["3644", "15525"], "LineaB"::["2481", "51033"]];
+	// Paradas donde se puede hacer transbordo
+	list<string> paradas_transbordo_ids <- ["51144", "1414"];
 
 	// Parámetros del mapa
 	float prob_bloqueo_carretera <- 0.0005;
 	float prob_trafico_carretera <- 0.005;
+	float media_calles_bloqueo <- 2.0;
+	float desviacion_calles_bloqueo <- 1.0;
+	float media_calles_trafico <- 6.0;
+	float desviacion_calles_trafico <- 3.0;
 
 	// Definición de líneas
 	// Línea 1
@@ -143,6 +159,64 @@ global {
 	}
 
 	// Funciones auxiliares
+	// Elige el destino de un pasajero según distribución normal de paradas
+	parada elegir_destino_pasajero(parada p_origen) {
+		// Encontrar líneas que pasan por el origen
+		list<string> lineas_origen <- lineas_map.keys where (p_origen in lineas_map[each]);
+		if (length(lineas_origen) = 0) { return nil; }
+
+		// Elegir una línea de salida aleatoria
+		string linea_vigente <- one_of(lineas_origen);
+
+		// Muestrear número de paradas según la línea de inicio (mínimo 1)
+		float media_linea <- (linea_vigente = "LineaA") ? media_paradas_lineaA : media_paradas_lineaB;
+		float desv_linea <- (linea_vigente = "LineaA") ? desviacion_paradas_lineaA : desviacion_paradas_lineaB;
+		int n_paradas <- max(1, int(gauss(media_linea, desv_linea)));
+		list<parada> ruta_vigente <- lineas_map[linea_vigente];
+		int pos_actual <- ruta_vigente index_of p_origen;
+		int paradas_recorridas <- 0;
+		parada resultado <- nil;
+
+		loop while: (paradas_recorridas < n_paradas) and (resultado = nil) {
+			int pos_siguiente <- pos_actual + 1;
+			// Si llegamos al final físico de la ruta, detenerse ahí (sin wraparound)
+			if (pos_siguiente >= length(ruta_vigente)) {
+				resultado <- ruta_vigente[pos_actual];
+			} else {
+				parada siguiente <- ruta_vigente[pos_siguiente];
+				list<string> finales_linea <- paradas_finales_linea[linea_vigente];
+				// Parada final de línea: el pasajero se detiene aquí
+				if (siguiente.id_parada in finales_linea) {
+					resultado <- siguiente;
+				// Parada de transbordo: decidir aleatoriamente si trasbordar
+				} else if (siguiente.id_parada in paradas_transbordo_ids) {
+					if (flip(prob_transbordo_pasajero)) {
+						list<string> otras_lineas <- lineas_map.keys where ((each != linea_vigente) and (siguiente in lineas_map[each]));
+						if (length(otras_lineas) > 0) {
+							// Trasbordo: cambiar a otra línea desde esta parada
+							linea_vigente <- one_of(otras_lineas);
+							ruta_vigente <- lineas_map[linea_vigente];
+							pos_actual <- ruta_vigente index_of siguiente;
+						} else {
+							pos_actual <- pos_siguiente;
+						}
+					} else {
+						pos_actual <- pos_siguiente;
+					}
+					paradas_recorridas <- paradas_recorridas + 1;
+				} else {
+					pos_actual <- pos_siguiente;
+					paradas_recorridas <- paradas_recorridas + 1;
+				}
+			}
+		}
+
+		if (resultado = nil) {
+			resultado <- ruta_vigente[pos_actual];
+		}
+		return resultado;
+	}
+
 	list<parada> construir_ruta(list<string> ids_paradas) {
 		list<parada> ruta <- [];
 		loop id_buscado over: ids_paradas {
@@ -248,7 +322,8 @@ global {
 		loop i from: 1 to: pasajeros_por_oleada {
 			parada p_origen <- one_of(todas_paradas_con_ruta where (mapa_accesibilidad[each] != nil and length(mapa_accesibilidad[each]) > 0));
 			if (p_origen != nil) {
-				parada p_destino <- one_of(mapa_accesibilidad[p_origen]);
+				parada p_destino <- elegir_destino_pasajero(p_origen);
+				if (p_destino = nil or p_destino = p_origen) { p_destino <- one_of(mapa_accesibilidad[p_origen]); }
 				create pasajero {
 					id_pasajero <- total_pasajeros_generados;
 					parada_origen <- p_origen;
@@ -331,19 +406,31 @@ species agente_mapa skills: [fipa] {
 	reflex bloquear_carretera when: !fin_simulacion {
 		bool bloquear <- flip(prob_bloqueo_carretera);
 		if (bloquear) {
-			calle c <- one_of(calle where (!each.bloqueada));
-			if (c != nil) {
-				ask c {
-					bloqueada <- true;
-					color <- #red;
+			calle c_inicio <- one_of(calle where (!each.bloqueada));
+			if (c_inicio != nil) {
+				int n_calles <- max(1, int(gauss(media_calles_bloqueo, desviacion_calles_bloqueo)));
+				list<calle> frontera <- [c_inicio];
+				list<calle> bloqueadas_ahora <- [];
+				loop while: (length(bloqueadas_ahora) < n_calles) and (length(frontera) > 0) {
+					calle c_actual <- one_of(frontera);
+					frontera >> c_actual;
+					if (!c_actual.bloqueada) {
+						ask c_actual {
+							bloqueada <- true;
+							color <- #red;
+						}
+						bloqueadas_ahora << c_actual;
+						list<calle> vecinas <- calle where (!each.bloqueada and !(each in bloqueadas_ahora) and !(each in frontera) and (each.shape distance_to c_actual.shape < 1.0 #m));
+						frontera <- frontera + vecinas;
+					}
 				}
-				// Reconstruir el grafo sin la calle bloqueada
+				// Reconstruir el grafo sin calles bloqueadas
 				red_viaria <- as_edge_graph(calle where (!each.bloqueada));
 				list<autobus> buses_activos <- autobus where (!each.ruta_completada);
 				loop b over: buses_activos {
-					do start_conversation to: [b] protocol: 'no-protocol' performative: 'inform' contents: ["carretera_bloqueada", c];
+					do start_conversation to: [b] protocol: 'no-protocol' performative: 'inform' contents: ["carretera_bloqueada", c_inicio];
 				}
-				if console_logs { write "[MAPA] Carretera bloqueada: " + c; }
+				if console_logs { write "[MAPA] Bloqueo de " + length(bloqueadas_ahora) + " calles desde: " + c_inicio; }
 			}
 		}
 	}
@@ -352,17 +439,29 @@ species agente_mapa skills: [fipa] {
 	reflex generar_trafico when: !fin_simulacion {
 		bool trafico <- flip(prob_trafico_carretera);
 		if (trafico) {
-			calle c <- one_of(calle where (!each.bloqueada and !each.con_trafico));
-			if (c != nil) {
-				ask c {
-					con_trafico <- true;
-					color <- #orange;
+			calle c_inicio <- one_of(calle where (!each.bloqueada and !each.con_trafico));
+			if (c_inicio != nil) {
+				int n_calles <- max(1, int(gauss(media_calles_trafico, desviacion_calles_trafico)));
+				list<calle> frontera <- [c_inicio];
+				list<calle> con_trafico_ahora <- [];
+				loop while: (length(con_trafico_ahora) < n_calles) and (length(frontera) > 0) {
+					calle c_actual <- one_of(frontera);
+					frontera >> c_actual;
+					if (!c_actual.bloqueada and !c_actual.con_trafico) {
+						ask c_actual {
+							con_trafico <- true;
+							color <- #orange;
+						}
+						con_trafico_ahora << c_actual;
+						list<calle> vecinas <- calle where (!each.bloqueada and !each.con_trafico and !(each in con_trafico_ahora) and !(each in frontera) and (each.shape distance_to c_actual.shape < 1.0 #m));
+						frontera <- frontera + vecinas;
+					}
 				}
 				list<autobus> buses_activos <- autobus where (!each.ruta_completada);
 				loop b over: buses_activos {
-					do start_conversation to: [b] protocol: 'no-protocol' performative: 'inform' contents: ["carretera_trafico", c];
+					do start_conversation to: [b] protocol: 'no-protocol' performative: 'inform' contents: ["carretera_trafico", c_inicio];
 				}
-				if console_logs { write "[MAPA] Tráfico en carretera: " + c; }
+				if console_logs { write "[MAPA] Tráfico en " + length(con_trafico_ahora) + " calles desde: " + c_inicio; }
 			}
 		}
 	}
@@ -1104,15 +1203,24 @@ species pasajero skills: [fipa] control: simple_bdi {
 experiment SimulacionAutobuses type: gui {
 	parameter "Paradas inicio LineaA (IDs)" var: paradas_inicio_A;
 	parameter "Paradas inicio LineaB (IDs)" var: paradas_inicio_B;
-	parameter "Capacidad máxima bus" var: capacidad_maxima_bus min: 20 max: 150 init: 86;
+	parameter "Capacidad máxima bus" var: capacidad_maxima_bus min: 20 max: 150 init: 100;
 	parameter "Velocidad bus (km/h)" var: velocidad_bus min: 10.0 max: 80.0 init: 40.0;
-	parameter "Frecuencia creación buses (s)" var: frecuencia_creacion_buses min: 120.0 max: 1800.0 init: 600.0;
-	parameter "Pasajeros por oleada" var: pasajeros_por_oleada min: 1 max: 20 init: 5;
-	parameter "Frecuencia creación pasajeros (s)" var: frecuencia_creacion_pasajeros min: 30.0 max: 600.0 init: 120.0;
-	parameter "Tiempo máx. espera pasajero (s)" var: tiempo_max_espera_pasajero min: 60.0 max: 3600.0 init: 900.0;
+	parameter "Frecuencia creación buses (s)" var: frecuencia_creacion_buses min: 120.0 max: 7200.0 init: 7200.0;
+	parameter "Pasajeros por oleada" var: pasajeros_por_oleada min: 1 max: 400 init: 328;
+	parameter "Frecuencia creación pasajeros (s)" var: frecuencia_creacion_pasajeros min: 30.0 max: 600.0 init: 60.0;
+	parameter "Tiempo máx. espera pasajero (s)" var: tiempo_max_espera_pasajero min: 60.0 max: 3600.0 init: 300.0;
 	parameter "Prob. bloqueo carretera" var: prob_bloqueo_carretera min: 0.0 max: 0.01 init: 0.0005;
+	parameter "Media calles bloqueadas" var: media_calles_bloqueo min: 1.0 max: 20.0 init: 2.0;
+	parameter "Desviación típica calles bloqueadas" var: desviacion_calles_bloqueo min: 0.1 max: 10.0 init: 1.0;
 	parameter "Prob. tráfico carretera" var: prob_trafico_carretera min: 0.0 max: 0.1 init: 0.005;
+	parameter "Media calles con tráfico" var: media_calles_trafico min: 1.0 max: 20.0 init: 6.0;
+	parameter "Desviación típica calles con tráfico" var: desviacion_calles_trafico min: 0.1 max: 10.0 init: 3.0;
 	parameter "Tiempo simulación (s)" var: max_tiempo_simulacion min: 600.0 max: 7200.0 init: 3600.0;
+	parameter "Media paradas pasajero (Línea A)" var: media_paradas_lineaA min: 1.0 max: 30.0 init: 8.0;
+	parameter "Desviación típica paradas pasajero (Línea A)" var: desviacion_paradas_lineaA min: 0.5 max: 15.0 init: 4.0;
+	parameter "Media paradas pasajero (Línea B)" var: media_paradas_lineaB min: 1.0 max: 30.0 init: 3.0;
+	parameter "Desviación típica paradas pasajero (Línea B)" var: desviacion_paradas_lineaB min: 0.5 max: 15.0 init: 1.0;
+	parameter "Prob. transbordo pasajero" var: prob_transbordo_pasajero min: 0.0 max: 1.0 init: 0.15;
 	parameter "Mostrar logs en consola" var: console_logs init: true;
 
 	output synchronized: false {
@@ -1124,7 +1232,7 @@ experiment SimulacionAutobuses type: gui {
 		}
 
 		display "Estadísticas" type: 2d refresh: every(10 #cycles) {
-			chart "Pasajeros" type: series {
+			chart "Pasajeros" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Generados" value: total_pasajeros_generados color: #blue;
 				data "En destino" value: total_pasajeros_llegados color: #green;
 				data "Abandonaron" value: total_pasajeros_abandonados color: #red;
@@ -1134,9 +1242,8 @@ experiment SimulacionAutobuses type: gui {
 		}
 
 		display "Autobuses" type: 2d refresh: every(10 #cycles) {
-			chart "Ocupación de autobuses" type: series {
+			chart "Ocupación de autobuses" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Plazas ocupadas total" value: sum(autobus collect (each.capacidad_maxima - each.plazas_disponibles)) color: #blue;
-				data "Autobuses activos" value: length(autobus where (!each.ruta_completada)) color: #green;
 			}
 		}
 	}
@@ -1166,7 +1273,7 @@ experiment Test_Bus_Lleva_Pasajero type: gui {
 		}
 
 		display "Estadísticas" type: 2d refresh: every(10 #cycles) {
-			chart "Pasajeros" type: series {
+			chart "Pasajeros" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Generados" value: total_pasajeros_generados color: #blue;
 				data "En destino" value: total_pasajeros_llegados color: #green;
 				data "Abandonaron" value: total_pasajeros_abandonados color: #red;
@@ -1176,9 +1283,8 @@ experiment Test_Bus_Lleva_Pasajero type: gui {
 		}
 
 		display "Autobuses" type: 2d refresh: every(10 #cycles) {
-			chart "Ocupación de autobuses" type: series {
+			chart "Ocupación de autobuses" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Plazas ocupadas total" value: sum(autobus collect (each.capacidad_maxima - each.plazas_disponibles)) color: #blue;
-				data "Autobuses activos" value: length(autobus where (!each.ruta_completada)) color: #green;
 			}
 		}
 	}
@@ -1240,7 +1346,7 @@ experiment Test_Transbordo type: gui {
 		}
 
 		display "Estadísticas" type: 2d refresh: every(10 #cycles) {
-			chart "Pasajeros" type: series {
+			chart "Pasajeros" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Generados" value: total_pasajeros_generados color: #blue;
 				data "En destino" value: total_pasajeros_llegados color: #green;
 				data "Abandonaron" value: total_pasajeros_abandonados color: #red;
@@ -1250,9 +1356,8 @@ experiment Test_Transbordo type: gui {
 		}
 
 		display "Autobuses" type: 2d refresh: every(10 #cycles) {
-			chart "Ocupación de autobuses" type: series {
+			chart "Ocupación de autobuses" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Plazas ocupadas total" value: sum(autobus collect (each.capacidad_maxima - each.plazas_disponibles)) color: #blue;
-				data "Autobuses activos" value: length(autobus where (!each.ruta_completada)) color: #green;
 			}
 		}
 	}
@@ -1315,7 +1420,7 @@ experiment Test_Abandono_Parada type: gui {
 		}
 
 		display "Estadísticas" type: 2d refresh: every(10 #cycles) {
-			chart "Pasajeros" type: series {
+			chart "Pasajeros" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Generados" value: total_pasajeros_generados color: #blue;
 				data "En destino" value: total_pasajeros_llegados color: #green;
 				data "Abandonaron" value: total_pasajeros_abandonados color: #red;
@@ -1325,9 +1430,8 @@ experiment Test_Abandono_Parada type: gui {
 		}
 
 		display "Autobuses" type: 2d refresh: every(10 #cycles) {
-			chart "Ocupación de autobuses" type: series {
+			chart "Ocupación de autobuses" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Plazas ocupadas total" value: sum(autobus collect (each.capacidad_maxima - each.plazas_disponibles)) color: #blue;
-				data "Autobuses activos" value: length(autobus where (!each.ruta_completada)) color: #green;
 			}
 		}
 	}
@@ -1415,7 +1519,7 @@ experiment Test_Conservar_Velocidad type: gui {
 		}
 
 		display "Estadísticas" type: 2d refresh: every(10 #cycles) {
-			chart "Pasajeros" type: series {
+			chart "Pasajeros" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Generados" value: total_pasajeros_generados color: #blue;
 				data "En destino" value: total_pasajeros_llegados color: #green;
 				data "Abandonaron" value: total_pasajeros_abandonados color: #red;
@@ -1425,9 +1529,8 @@ experiment Test_Conservar_Velocidad type: gui {
 		}
 
 		display "Autobuses" type: 2d refresh: every(10 #cycles) {
-			chart "Ocupación de autobuses" type: series {
+			chart "Ocupación de autobuses" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Plazas ocupadas total" value: sum(autobus collect (each.capacidad_maxima - each.plazas_disponibles)) color: #blue;
-				data "Autobuses activos" value: length(autobus where (!each.ruta_completada)) color: #green;
 			}
 		}
 	}
@@ -1486,7 +1589,7 @@ experiment Test_Capacidad_Maxima type: gui {
 		}
 
 		display "Estadísticas" type: 2d refresh: every(10 #cycles) {
-			chart "Pasajeros" type: series {
+			chart "Pasajeros" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Generados" value: total_pasajeros_generados color: #blue;
 				data "En destino" value: total_pasajeros_llegados color: #green;
 				data "Abandonaron" value: total_pasajeros_abandonados color: #red;
@@ -1496,9 +1599,8 @@ experiment Test_Capacidad_Maxima type: gui {
 		}
 
 		display "Autobuses" type: 2d refresh: every(10 #cycles) {
-			chart "Ocupación de autobuses" type: series {
+			chart "Ocupación de autobuses" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Plazas ocupadas total" value: sum(autobus collect (each.capacidad_maxima - each.plazas_disponibles)) color: #blue;
-				data "Autobuses activos" value: length(autobus where (!each.ruta_completada)) color: #green;
 			}
 		}
 	}
@@ -1587,7 +1689,7 @@ experiment Test_Cola_Buses type: gui {
 		}
 
 		display "Estadísticas" type: 2d refresh: every(10 #cycles) {
-			chart "Pasajeros" type: series {
+			chart "Pasajeros" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Generados" value: total_pasajeros_generados color: #blue;
 				data "En destino" value: total_pasajeros_llegados color: #green;
 				data "Abandonaron" value: total_pasajeros_abandonados color: #red;
@@ -1597,9 +1699,8 @@ experiment Test_Cola_Buses type: gui {
 		}
 
 		display "Autobuses" type: 2d refresh: every(10 #cycles) {
-			chart "Ocupación de autobuses" type: series {
+			chart "Ocupación de autobuses" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Plazas ocupadas total" value: sum(autobus collect (each.capacidad_maxima - each.plazas_disponibles)) color: #blue;
-				data "Autobuses activos" value: length(autobus where (!each.ruta_completada)) color: #green;
 			}
 		}
 	}
@@ -1687,7 +1788,7 @@ experiment Test_Generacion_Periodica type: gui {
 		}
 
 		display "Estadísticas" type: 2d refresh: every(10 #cycles) {
-			chart "Pasajeros" type: series {
+			chart "Pasajeros" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Generados" value: total_pasajeros_generados color: #blue;
 				data "En destino" value: total_pasajeros_llegados color: #green;
 				data "Abandonaron" value: total_pasajeros_abandonados color: #red;
@@ -1697,9 +1798,8 @@ experiment Test_Generacion_Periodica type: gui {
 		}
 
 		display "Autobuses" type: 2d refresh: every(10 #cycles) {
-			chart "Ocupación de autobuses" type: series {
+			chart "Ocupación de autobuses" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Plazas ocupadas total" value: sum(autobus collect (each.capacidad_maxima - each.plazas_disponibles)) color: #blue;
-				data "Autobuses activos" value: length(autobus where (!each.ruta_completada)) color: #green;
 			}
 		}
 	}
@@ -1743,7 +1843,7 @@ experiment Test_Trafico_Velocidad type: gui {
 		}
 
 		display "Estadísticas" type: 2d refresh: every(10 #cycles) {
-			chart "Pasajeros" type: series {
+			chart "Pasajeros" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Generados" value: total_pasajeros_generados color: #blue;
 				data "En destino" value: total_pasajeros_llegados color: #green;
 				data "Abandonaron" value: total_pasajeros_abandonados color: #red;
@@ -1753,9 +1853,8 @@ experiment Test_Trafico_Velocidad type: gui {
 		}
 
 		display "Autobuses" type: 2d refresh: every(10 #cycles) {
-			chart "Ocupación de autobuses" type: series {
+			chart "Ocupación de autobuses" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Plazas ocupadas total" value: sum(autobus collect (each.capacidad_maxima - each.plazas_disponibles)) color: #blue;
-				data "Autobuses activos" value: length(autobus where (!each.ruta_completada)) color: #green;
 			}
 		}
 	}
@@ -1827,7 +1926,7 @@ experiment Test_Calles_Bloqueadas type: gui {
 		}
 
 		display "Estadísticas" type: 2d refresh: every(10 #cycles) {
-			chart "Pasajeros" type: series {
+			chart "Pasajeros" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Generados" value: total_pasajeros_generados color: #blue;
 				data "En destino" value: total_pasajeros_llegados color: #green;
 				data "Abandonaron" value: total_pasajeros_abandonados color: #red;
@@ -1837,9 +1936,8 @@ experiment Test_Calles_Bloqueadas type: gui {
 		}
 
 		display "Autobuses" type: 2d refresh: every(10 #cycles) {
-			chart "Ocupación de autobuses" type: series {
+			chart "Ocupación de autobuses" type: series x_label: "tiempo (segundos)" y_label: "número de pasajeros" {
 				data "Plazas ocupadas total" value: sum(autobus collect (each.capacidad_maxima - each.plazas_disponibles)) color: #blue;
-				data "Autobuses activos" value: length(autobus where (!each.ruta_completada)) color: #green;
 			}
 		}
 	}
